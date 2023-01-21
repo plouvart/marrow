@@ -1,11 +1,12 @@
 __version__ = "0.0.1"
 
-from shapely.geometry import Polygon,Point,LineString,MultiLineString,MultiPoint
-from shapely.affinity import translate
-from shapely.ops import nearest_points,unary_union,linemerge
+from shapely.geometry import Polygon,Point,LineString,MultiLineString,MultiPoint,LinearRing
+from shapely.affinity import translate,rotate
+from shapely.ops import nearest_points,unary_union,linemerge,substring
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
+import time
 
 
 def disp(poly, *args, ax=None, **kwargs):
@@ -15,86 +16,351 @@ def disp(poly, *args, ax=None, **kwargs):
     else:
         return ax
 
+def cut(line, distance):
+    # Cuts a line in two at a distance from its starting point
+    if distance <= 0.0 or distance >= line.length:
+        return [LineString(line)]
+    coords = list(line.coords)
+    for i, p in enumerate(coords):
+        pd = line.project(Point(p))
+        if pd == distance:
+            return [
+                LineString(coords[:i+1]),
+                LineString(coords[i:])]
+        if pd > distance:
+            cp = line.interpolate(distance)
+            return [
+                LineString(coords[:i] + [(cp.x, cp.y)]),
+                LineString([(cp.x, cp.y)] + coords[i:])]
 
-def simple_polygon_skeleton(poly):
-    ax=None
-    contour = poly.exterior
-    min_dist = 0.125/5 # Should be < min distance between all points / 2
-    max_dist = 10 # Should be > max distance between all points
+def create_ballpoint(p0, p1, p2, v, contour, min_dist, max_dist):
+    p = Point(p1)
+    corner = LineString(
+        [p0, p1, p2]
+    )
+    max_length = p.distance(
+        (back_point := nearest_points(
+            p, 
+            LineString(
+                [
+                    p1 + v * min_dist, 
+                    p1 + v * max_dist,
+                ]
+            ).intersection(contour)
+        )[1])
+    )
+    right_l = max_length
+    left_l = min_dist
+    good_l = None
+    while 1:
+        mid_l = (right_l + left_l) / 2
 
-    c = contour.coords[:-1]
-    v = np.array(list(zip(c[-1:] + c[:-1], c, c[1:] + c[:1])))
+        # ax = disp(contour)
+        # ax = disp(LineString([p, back_point]), color="yellow", ax=ax)
+        # ax = disp(Point(p1), color="b", ax=ax)
+        # ax = disp(Point(p1 + v * right_l), color="r", ax=ax)
+        # ax = disp(Point(p1 + v * left_l), color="g", ax=ax)
+        # ax = disp(Point(p1 + v * mid_l), color="purple", ax=ax)
+        # ax = disp(corner, color="yellow", ax=ax)
+        # ax = disp(
+            # nearest_points(
+                # Point(p1 + v * mid_l), 
+                # contour,
+            # )[1], ax=ax, color="orange"
+        # )
+        # plt.show()
+        
+
+        if corner.distance(
+            nearest_points(
+                Point(p1 + v * mid_l), 
+                contour,
+            )[1]
+        ) < 0.00001:
+            good_l = mid_l
+            right_l = right_l
+            left_l = mid_l
+        else:
+            right_l = mid_l
+            left_l = left_l
+
+        if ((right_l - left_l) < min_dist) and good_l is not None:
+            break
+    
+    return Point(p1 + v * good_l)
+
+def create_ballpoint_interior(p0, p1, p2, v, interior, contour, min_dist, max_dist):
+    p = Point(p1)
+    corner = LineString(
+        [p0, p1, p2]
+    )
+    max_length = p.distance(
+        (back_point := nearest_points(
+            p, 
+            LineString(
+                [
+                    p1 + v * min_dist, 
+                    p1 + v * max_dist,
+                ]
+            ).intersection(contour)
+        )[1])
+    )
+    right_l = max_length
+    left_l = min_dist
+    good_l = None
+    while 1:
+        mid_l = (right_l + left_l) / 2
+
+        # ax = disp(interior)
+        # ax = disp(LineString([p, back_point]), color="yellow", ax=ax)
+        # ax = disp(Point(p1), color="b", ax=ax)
+        # ax = disp(Point(p1 + v * right_l), color="r", ax=ax)
+        # ax = disp(Point(p1 + v * left_l), color="g", ax=ax)
+        # ax = disp(Point(p1 + v * mid_l), color="purple", ax=ax)
+        # ax = disp(corner, color="yellow", ax=ax)
+        # ax = disp(
+            # nearest_points(
+                # Point(p1 + v * mid_l), 
+                # interior,
+            # )[1], ax=ax, color="orange"
+        # )
+        # plt.show()
+        
+
+        if corner.distance(
+            nearest_points(
+                Point(p1 + v * mid_l), 
+                contour,
+            )[1]
+        ) < 0.00001:
+            good_l = mid_l
+            right_l = right_l
+            left_l = mid_l
+        else:
+            right_l = mid_l
+            left_l = left_l
+
+        if ((right_l - left_l) < min_dist) and good_l is not None:
+            break
+    
+    return Point(p1 + v * good_l)
+
+
+    
+def compute_corners(contour):
+    c1 = contour.coords[:-1]
+    c0 = c1[-1:] + c1[:-1]
+    c2 = c1[1:] + c1[:1]
+    v = np.array(list(zip(c0, c1, c2)))
     v1 = v[:,1,:] - v[:,0,:]
     v2 = v[:,2,:] - v[:,1,:]
     v1 = v1 / (np.sum(v1**2, axis=1)**.5).reshape(-1,1)
     v2 = v2 / (np.sum(v2**2, axis=1)**.5).reshape(-1,1)
     
-    vv = np.array([
-        s * (v - u) if (s := (-np.sign(np.arctan2(np.cross(u,v), sum(u**2)**.5 * sum(v**2)**.5)))) != 0
-        else np.array([[0,1],[-1,0]]).dot(v)
+    normals = np.array([
+        s * (v - u) if (s := (np.sign(np.arctan2(np.cross(u,v), sum(u**2)**.5 * sum(v**2)**.5)))) != 0
+        else np.array([[0,-1],[1,0]]).dot(v)
         for u,v in zip(v1,v2)
     ])
+    normals = normals / (np.sum(normals**2, axis=1)**.5).reshape(-1,1)
 
-    c1 = c
-    c2 = c + vv
+    return c0,c1,c2,normals
 
-    ax = disp(poly, alpha=0.4)
-    for p,q in zip(c1,c2):
-        ax = disp(LineString([p,q]), ax=ax, color="r")
-    plt.show()
-    
 
-    vs = (c2 - c1)
-
-    res = MultiLineString([])
-
-    old_b = None
+def simple_polygon_skeleton(poly):
+    t1 = time.time()
     ax=None
-    for i,(p,v) in enumerate(zip(c1, vs)):
-        b = Point(p)
-        l = LineString([p + v * min_dist, p + v * max_dist])
-        if (
-            l.intersects(contour) and l.intersects(res) and 
-            b.distance(l.intersection(res)) < b.distance(l.intersection(contour))
-        ) or (
-            not l.intersects(contour) and l.intersects(res)
-        ):
-            b = nearest_points(b, l.intersection(res))[1]
-            old_b = None
-        else:
-            d = 0
-            while 1:
-                new_b = translate(b, *(v*min_dist))
-                new_d = new_b.distance(contour)
-                if new_d < d:
-                    break
-                else:
-                    b = new_b
-                    d = new_d
+    contour = poly.exterior
+    if not contour.is_ccw:
+        contour = LinearRing(contour.coords[::-1])
 
-            if old_b is not None:
-                res = res.union(LineString([old_b, b]))
-            elif not res.is_empty:
-                old_b = nearest_points(b, res)[1]
-                res = res.union(LineString([old_b, b]))
-
-            ax = disp(Point(b).buffer(d), ax=ax, alpha=i/len(c1))
-            old_b = b
-        ax = disp(LineString([p, p + v / 4]), ax=ax, color="r")
         
-    disp(res, ax=ax, color="g")
+    min_dist = 0.125/20 # Should be < min distance between all points / 2
+    max_dist = 10 # Should be > max distance between all points
 
-    disp(poly, ax=ax, alpha=0.4)
+    c0,c1,c2,vv = compute_corners(contour)
+    # ax = disp(poly, alpha=0.4)
+    # for p,q in zip(c1,c2):
+        # ax = disp(LineString([p,q]), ax=ax, color="r")
+    # plt.show()
+
+    balls = []
+    ax= None
+    for i,(p0, p1, p2, v) in enumerate(zip(c0, c1, c2, vv)):
+        b = create_ballpoint(p0,p1,p2,v,contour,min_dist,max_dist)
+        # ax = disp(b.buffer(b.distance(contour)), ax=ax, alpha=0.5)
+        # ax = disp(LineString([p1,b]), ax=ax)
+        balls.append(b)
+    # ax = disp(contour, color="r", ax=ax)
+    # plt.show()
+
+
+    t = time.time()
+    dists = np.ones((len(balls), len(balls))) * np.inf
+    inds = list(range(len(balls)))
+    for i in inds:
+        for j in inds[i+1:]:
+            if not LineString([balls[i], balls[j]]).intersects(contour):
+                dists[i,j] = balls[i].distance(balls[j])
+    skeleton = MultiLineString([])
+    used_points = [inds.pop(0)]
+    unused_points = inds
+
+    min_used = None
+    min_unused = None
+    while len(unused_points):
+        min_d = np.inf
+        for i1 in used_points:
+            for i2 in unused_points:
+                if i1 > i2:
+                    if (d:=dists[i2,i1]) < min_d:
+                        min_used = i1
+                        min_unused = i2
+                        min_d = d
+                else:
+                    if (d:=dists[i1,i2]) < min_d:
+                        min_used = i1
+                        min_unused = i2
+                        min_d = d
+        used_points.append(min_unused)
+        unused_points.remove(min_unused)
+        skeleton = skeleton.union(LineString([balls[min_unused], balls[min_used]]))
+    print("Time ellapsed: ", time.time() - t1)
+
+    ax = disp(contour, color="r")
+    disp(skeleton, color="g", ax=ax)
     plt.show()
+    return skeleton
 
+
+def compute_interior_corners(interior):
+    c1 = interior.coords[1:][::-1]
+    c0 = c1[-1:] + c1[:-1]
+    c2 = c1[1:] + c1[:1]
+    v = np.array(list(zip(c0, c1, c2)))
+    v1 = v[:,1,:] - v[:,0,:]
+    v2 = v[:,2,:] - v[:,1,:]
+    v1 = v1 / (np.sum(v1**2, axis=1)**.5).reshape(-1,1)
+    v2 = v2 / (np.sum(v2**2, axis=1)**.5).reshape(-1,1)
+    
+    normals = np.array([
+        s * (v - u) if (s := (np.sign(np.arctan2(np.cross(u,v), sum(u**2)**.5 * sum(v**2)**.5)))) != 0
+        else np.array([[0,-1],[1,0]]).dot(v)
+        for u,v in zip(v1,v2)
+    ])
+    normals = normals / (np.sum(normals**2, axis=1)**.5).reshape(-1,1)
+
+    print(c0,c1,c2)
+    return c0,c1,c2,normals
+
+
+
+
+def complex_polygon_skeleton(poly):
+    t1 = time.time()
+    ax=None
+    contour = MultiLineString(
+        [poly.exterior] + list(poly.interiors)
+    )
+    # if not contour.is_ccw:
+        # contour = LinearRing(contour.coords[::-1])
+
+    min_dist = 0.125/20 # Should be < min distance between all points / 2
+    max_dist = 10 # Should be > max distance between all points
+
+
+    balls = []
+    ax= None
+
+    for interior in contour.geoms:
+        c0,c1,c2,vv = compute_interior_corners(interior)
+        # ax = disp(poly, alpha=0.4)
+        # for p,q in zip(c1,c2):
+            # ax = disp(LineString([p,q]), ax=ax, color="r")
+        # plt.show()
+
+        ax = None
+        for i,(p0, p1, p2, v) in enumerate(zip(c0, c1, c2, vv)):
+            b = create_ballpoint_interior(p0,p1,p2,v,interior,contour,min_dist,max_dist)
+            # ax = disp(b.buffer(b.distance(interior)), ax=ax, alpha=0.5)
+            # ax = disp(LineString([p1,b]), ax=ax)
+            balls.append(b)
+        # ax = disp(contour, color="r", ax=ax)
+        # plt.show()
+
+
+    t = time.time()
+    dists = np.ones((len(balls), len(balls))) * np.inf
+    inds = list(range(len(balls)))
+    for i in inds:
+        for j in inds[i+1:]:
+            if LineString([balls[i], balls[j]]).within(poly):
+                dists[i,j] = balls[i].distance(balls[j])
+    skeleton = MultiLineString([])
+    used_points = [inds.pop(0)]
+    unused_points = inds
+
+    min_used = None
+    min_unused = None
+    while len(unused_points):
+        min_d = np.inf
+        for i1 in used_points:
+            for i2 in unused_points:
+                if i1 > i2:
+                    if (d:=dists[i2,i1]) < min_d:
+                        min_used = i1
+                        min_unused = i2
+                        min_d = d
+                else:
+                    if (d:=dists[i1,i2]) < min_d:
+                        min_used = i1
+                        min_unused = i2
+                        min_d = d
+        used_points.append(min_unused)
+        unused_points.remove(min_unused)
+        skeleton = skeleton.union(LineString([balls[min_unused], balls[min_used]]))
+    print("Time ellapsed: ", time.time() - t1)
+
+    ax = disp(poly, color="r", alpha=0.3)
+    ax = disp(skeleton, color="g", ax=ax)
+
+    plt.show()
+    return skeleton
 
 if __name__ == "__main__":
+    # EASY
     poly = Polygon([(0,0), (1,0), (1,1), (0,1)]).difference(
         Polygon([(0.25,0), (0.75,0), (0.75,0.5), (0.25,0.5)])
+    )
+
+    # LOW
+    # poly = Polygon([(0,0), (1,0), (1,1), (0,1)]).difference(
+        # Polygon([(0.25,0), (0.75,0), (0.75,0.95), (0.25,0.95)])
+    # )
+
+    # ).union(
+        # Polygon([(-3,0),(0,0),(0,0.25),(-3,0.25)])
+    # ).union(
+        # Polygon([(-2,1),(-2.1,-2),(-0.9,-2),(-1,1.5)])
+    # )
+
+    poly = Polygon([(0,0), (1,0), (1,1), (0,1)]).difference(
+        Polygon([(0.125,0), (0.75,0), (0.75,0.2), (0.25,0.5)])
     ).union(
         Polygon([(-1,0),(0,0),(0,0.25),(-1,0.25)])
     )
-    simple_polygon_skeleton(poly)
+    poly = poly.union(translate(poly, 2, 0))
+
+    poly = poly.union(translate(rotate(poly, 90), 1, 1))
+    poly = poly.union(translate(rotate(poly, 180), 0, 0))
+    poly = poly.union(translate(poly, 3, 1))
+    # poly1 = poly.buffer(0.0412)
+    # poly = poly1
+
+    disp(poly)
+    plt.show()
+    # simple_polygon_skeleton(poly)
+    complex_polygon_skeleton(poly)
     
 
 
